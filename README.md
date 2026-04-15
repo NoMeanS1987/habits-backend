@@ -33,15 +33,6 @@ uvicorn main:app --reload
 # запустить бота (в отдельном терминале)
 python bot.py
 ```
-
-## Деплой на Railway
-
-1. Создай новый проект на [railway.app](https://railway.app)
-2. Подключи этот репозиторий
-3. Добавь PostgreSQL плагин
-4. Добавь переменные окружения: `BOT_TOKEN`, `DATABASE_URL`
-5. Railway сам подхватит `Procfile` и запустит оба процесса
-
 ## API
 
 | Метод | Эндпоинт | Описание |
