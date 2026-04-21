@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, String, Text
 from sqlalchemy.sql import func
 
 from database import Base
@@ -11,4 +11,5 @@ class User(Base):
     telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
     state_json = Column(Text, nullable=False, default="{}")
     is_active = Column(Boolean, default=True, nullable=False)
+    tz = Column(String(64), nullable=False, default="Europe/Moscow")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

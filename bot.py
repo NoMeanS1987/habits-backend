@@ -2,15 +2,18 @@ import asyncio
 import json
 import logging
 import os
-from datetime import date
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
+from database import DATABASE_URL, SessionLocal
 from models import User
 
 logger = logging.getLogger(__name__)
@@ -24,11 +27,22 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# JS getDay(): 0=Sun, 1=Mon ... 6=Sat
+# Single shared scheduler. Jobs persisted in Postgres so they survive restarts.
+scheduler = AsyncIOScheduler(
+    jobstores={"default": SQLAlchemyJobStore(url=DATABASE_URL)},
+    timezone="UTC",
+)
+
+REMINDER_HORIZON_HOURS = 48  # how far ahead per-habit reminders are scheduled
+JOB_PREFIX = "rem_"  # all user-scheduled reminder jobs start with this
+
+
+# ─── Weekday mapping ──────────────────────────────────────────────────────────
+# JS getDay(): 0=Sun ... 6=Sat
 # Python weekday(): 0=Mon ... 6=Sun
 # Mapping: js = (py + 1) % 7
-def _js_weekday(today: date) -> int:
-    return (today.weekday() + 1) % 7
+def _js_weekday(d: date) -> int:
+    return (d.weekday() + 1) % 7
 
 
 # ─── DB helpers (sync, run via asyncio.to_thread) ─────────────────────────────
@@ -37,6 +51,14 @@ def _get_active_users() -> list[User]:
     db: Session = SessionLocal()
     try:
         return db.query(User).filter(User.is_active == True).all()
+    finally:
+        db.close()
+
+
+def _get_user(telegram_id: int) -> User | None:
+    db: Session = SessionLocal()
+    try:
+        return db.query(User).filter(User.telegram_id == telegram_id).first()
     finally:
         db.close()
 
@@ -52,8 +74,6 @@ def _set_active(telegram_id: int, active: bool) -> None:
         db.close()
 
 
-# ─── Scheduling logic ─────────────────────────────────────────────────────────
-
 def _parse_state(user: User) -> dict:
     try:
         return json.loads(user.state_json)
@@ -61,8 +81,17 @@ def _parse_state(user: User) -> dict:
         return {}
 
 
-def _is_habit_due(habit: dict, today: date) -> bool:
-    js_day = _js_weekday(today)
+def _safe_tz(name: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(name or "Europe/Moscow")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("Europe/Moscow")
+
+
+# ─── Repeat-rule helpers ──────────────────────────────────────────────────────
+
+def _is_habit_due(habit: dict, day: date) -> bool:
+    js_day = _js_weekday(day)
     repeat = habit.get("repeat", "daily")
     if repeat == "daily":
         return True
@@ -73,13 +102,31 @@ def _is_habit_due(habit: dict, today: date) -> bool:
     if repeat == "custom":
         return js_day in habit.get("days", [])
     if repeat == "interval":
-        interval = habit.get("intervalDays", 2)
+        interval = habit.get("intervalDays", 2) or 2
         try:
-            created = date.fromisoformat(habit["createdAt"][:10])
-            return (today - created).days % interval == 0
+            created = date.fromisoformat((habit.get("createdAt") or "2025-01-01")[:10])
+            return (day - created).days >= 0 and (day - created).days % interval == 0
         except Exception:
             return False
     return True
+
+
+def _is_todo_due(todo: dict, day: date) -> bool:
+    repeat = todo.get("repeat", "none")
+    if todo.get("done"):
+        return False
+    if repeat == "none":
+        return todo.get("date") == day.isoformat()
+    js_day = _js_weekday(day)
+    if repeat == "daily":
+        return True
+    if repeat == "weekdays":
+        return 1 <= js_day <= 5
+    if repeat == "weekend":
+        return js_day == 0 or js_day == 6
+    if repeat == "custom":
+        return js_day in todo.get("days", [])
+    return False
 
 
 def _is_done_today(habit: dict, today_str: str) -> bool:
@@ -87,26 +134,23 @@ def _is_done_today(habit: dict, today_str: str) -> bool:
 
 
 def _get_todos_for_today(todos: list, today: date) -> list:
-    today_str = today.isoformat()
-    js_day = _js_weekday(today)
-    result = []
-    for todo in todos:
-        if todo.get("done"):
-            continue
-        repeat = todo.get("repeat", "none")
-        if repeat == "none":
-            if todo.get("date") == today_str:
-                result.append(todo)
-        elif repeat == "daily":
-            result.append(todo)
-        elif repeat == "weekdays" and 1 <= js_day <= 5:
-            result.append(todo)
-        elif repeat == "weekend" and (js_day == 0 or js_day == 6):
-            result.append(todo)
-        elif repeat == "custom" and js_day in todo.get("days", []):
-            result.append(todo)
-    return result
+    return [t for t in todos if _is_todo_due(t, today)]
 
+
+def _parse_hhmm(s: str | None) -> tuple[int, int] | None:
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        h, m = s.split(":")
+        h, m = int(h), int(m)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except Exception:
+        pass
+    return None
+
+
+# ─── Sending ──────────────────────────────────────────────────────────────────
 
 async def _send_safe(telegram_id: int, text: str, **kwargs) -> bool:
     """Send message, deactivate user if they blocked the bot."""
@@ -122,12 +166,188 @@ async def _send_safe(telegram_id: int, text: str, **kwargs) -> bool:
         return False
 
 
-# ─── Notifications ────────────────────────────────────────────────────────────
+# ─── Per-habit / per-todo reminder callbacks ─────────────────────────────────
+# These run in the scheduler event loop. Keep them idempotent-ish: re-check
+# current state in case the habit was deleted / marked done / user deactivated.
+
+async def send_habit_reminder(telegram_id: int, habit_id: int):
+    user = await asyncio.to_thread(_get_user, telegram_id)
+    if not user or not user.is_active:
+        return
+    state = _parse_state(user)
+    habit = next((h for h in state.get("habits", []) if h.get("id") == habit_id), None)
+    if not habit:
+        return
+    tz = _safe_tz(state.get("tz") or user.tz)
+    today_local = datetime.now(tz).date()
+    # Only fire if habit is due today AND not already done
+    if not _is_habit_due(habit, today_local):
+        return
+    if _is_done_today(habit, today_local.isoformat()):
+        return
+    streak = habit.get("streak") or 0
+    streak_str = f" 🔥{streak}" if streak >= 2 else ""
+    text = (
+        f"🌱 <b>Напоминание:</b> {habit['name']}{streak_str}\n\n"
+        f"<a href='{WEBAPP_URL}'>Отметить →</a>"
+    )
+    await _send_safe(telegram_id, text, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def send_todo_reminder(telegram_id: int, todo_id: int):
+    user = await asyncio.to_thread(_get_user, telegram_id)
+    if not user or not user.is_active:
+        return
+    state = _parse_state(user)
+    todo = next((t for t in state.get("todos", []) if t.get("id") == todo_id), None)
+    if not todo or todo.get("done"):
+        return
+    tz = _safe_tz(state.get("tz") or user.tz)
+    today_local = datetime.now(tz).date()
+    if not _is_todo_due(todo, today_local):
+        return
+    text = (
+        f"✅ <b>Задача:</b> {todo['text']}\n\n"
+        f"<a href='{WEBAPP_URL}'>Открыть →</a>"
+    )
+    await _send_safe(telegram_id, text, parse_mode="HTML", disable_web_page_preview=True)
+
+
+# ─── Rescheduling logic ──────────────────────────────────────────────────────
+
+def _remove_user_jobs(telegram_id: int) -> int:
+    """Remove all reminder jobs belonging to this user. Returns count removed."""
+    prefix = f"{JOB_PREFIX}{telegram_id}_"
+    removed = 0
+    for job in scheduler.get_jobs():
+        if job.id.startswith(prefix):
+            try:
+                scheduler.remove_job(job.id)
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+def _schedule_one(job_id: str, func, run_at_utc: datetime, args: list):
+    # replace_existing means editing a habit silently replaces its old job
+    scheduler.add_job(
+        func,
+        "date",
+        run_date=run_at_utc,
+        id=job_id,
+        args=args,
+        replace_existing=True,
+        misfire_grace_time=300,  # tolerate 5 min lag after restart
+    )
+
+
+def _upcoming_fires(
+    time_str: str,
+    user_tz: ZoneInfo,
+    is_due_fn,
+    now_utc: datetime,
+    horizon_hours: int,
+) -> list[datetime]:
+    """Yield UTC datetimes when a reminder should fire across the horizon."""
+    hm = _parse_hhmm(time_str)
+    if not hm:
+        return []
+    hour, minute = hm
+    now_local = now_utc.astimezone(user_tz)
+    horizon_end = now_utc + timedelta(hours=horizon_hours)
+    fires: list[datetime] = []
+    # Check up to (horizon_hours/24 + 2) days to cover edge cases
+    max_days = horizon_hours // 24 + 2
+    for offset in range(max_days):
+        day_local = (now_local + timedelta(days=offset)).date()
+        if not is_due_fn(day_local):
+            continue
+        fire_local = datetime.combine(
+            day_local, dtime(hour, minute), tzinfo=user_tz
+        )
+        fire_utc = fire_local.astimezone(timezone.utc)
+        if fire_utc <= now_utc:
+            continue
+        if fire_utc > horizon_end:
+            break
+        fires.append(fire_utc)
+    return fires
+
+
+def reschedule_user_sync(telegram_id: int) -> int:
+    """Rebuild per-habit/per-todo reminder jobs for one user. Returns jobs added."""
+    user = _get_user(telegram_id)
+    if not user:
+        return 0
+    state = _parse_state(user)
+    tz = _safe_tz(state.get("tz") or user.tz)
+    now_utc = datetime.now(timezone.utc)
+
+    # Wipe old jobs for this user first
+    _remove_user_jobs(telegram_id)
+
+    if not user.is_active:
+        return 0
+
+    added = 0
+    # Habits
+    for habit in state.get("habits", []):
+        hid = habit.get("id")
+        time_str = habit.get("reminderTime")
+        if not hid or not time_str:
+            continue
+        fires = _upcoming_fires(
+            time_str, tz, lambda d, h=habit: _is_habit_due(h, d),
+            now_utc, REMINDER_HORIZON_HOURS,
+        )
+        for fire_utc in fires:
+            job_id = f"{JOB_PREFIX}{telegram_id}_h{hid}_{int(fire_utc.timestamp())}"
+            _schedule_one(job_id, send_habit_reminder, fire_utc, [telegram_id, hid])
+            added += 1
+
+    # Todos
+    for todo in state.get("todos", []):
+        tid = todo.get("id")
+        time_str = todo.get("reminderTime")
+        if not tid or not time_str or todo.get("done"):
+            continue
+        fires = _upcoming_fires(
+            time_str, tz, lambda d, t=todo: _is_todo_due(t, d),
+            now_utc, REMINDER_HORIZON_HOURS,
+        )
+        for fire_utc in fires:
+            job_id = f"{JOB_PREFIX}{telegram_id}_t{tid}_{int(fire_utc.timestamp())}"
+            _schedule_one(job_id, send_todo_reminder, fire_utc, [telegram_id, tid])
+            added += 1
+
+    logger.info("Rescheduled user %d: %d reminder jobs", telegram_id, added)
+    return added
+
+
+async def reschedule_user(telegram_id: int) -> int:
+    """Async wrapper — safe to call from FastAPI handlers."""
+    return await asyncio.to_thread(reschedule_user_sync, telegram_id)
+
+
+async def reschedule_all_active():
+    """Nightly job: extend horizon for every active user."""
+    users = await asyncio.to_thread(_get_active_users)
+    total = 0
+    for u in users:
+        try:
+            total += await asyncio.to_thread(reschedule_user_sync, u.telegram_id)
+        except Exception as e:
+            logger.warning("reschedule failed for %d: %s", u.telegram_id, e)
+    logger.info("Nightly reschedule: %d users, %d jobs total", len(users), total)
+
+
+# ─── Legacy morning/evening summaries (Moscow, for now) ──────────────────────
 
 async def send_morning_reminder():
     today = date.today()
     users = await asyncio.to_thread(_get_active_users)
-    sem = asyncio.Semaphore(25)  # stay safely under Telegram's 30 msg/sec limit
+    sem = asyncio.Semaphore(25)
 
     async def notify(user: User):
         async with sem:
@@ -198,13 +418,15 @@ async def send_evening_reminder():
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await asyncio.to_thread(_set_active, message.from_user.id, True)
+    await reschedule_user(message.from_user.id)
     await message.answer(
         "👋 Привет! Это бот для трекера привычек.\n\n"
         "Я буду присылать:\n"
         "• ☀️ <b>09:00</b> — план на день\n"
-        "• 🌙 <b>21:00</b> — что не успел сделать\n\n"
+        "• 🌙 <b>21:00</b> — что не успел сделать\n"
+        "• 🔔 Персональные напоминания по каждой привычке/задаче (в твоей таймзоне)\n\n"
         f"<a href='{WEBAPP_URL}'>Открыть трекер →</a>\n\n"
-        "/off — отключить уведомления",
+        "/off — отключить все уведомления",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -213,16 +435,39 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("off"))
 async def cmd_off(message: types.Message):
     await asyncio.to_thread(_set_active, message.from_user.id, False)
+    await asyncio.to_thread(_remove_user_jobs, message.from_user.id)
     await message.answer("Уведомления отключены. /start — включить снова.")
 
 
 # ─── Entry point (called from main.py lifespan) ───────────────────────────────
 
 async def start_bot():
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(send_morning_reminder, "cron", hour=9, minute=0)
-    scheduler.add_job(send_evening_reminder, "cron", hour=21, minute=0)
+    # Global summaries in Moscow time (tz-aware trigger)
+    scheduler.add_job(
+        send_morning_reminder,
+        CronTrigger(hour=9, minute=0, timezone="Europe/Moscow"),
+        id="global_morning",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        send_evening_reminder,
+        CronTrigger(hour=21, minute=0, timezone="Europe/Moscow"),
+        id="global_evening",
+        replace_existing=True,
+    )
+    # Nightly reschedule to extend per-user horizon
+    scheduler.add_job(
+        reschedule_all_active,
+        CronTrigger(hour=3, minute=0, timezone="UTC"),
+        id="nightly_reschedule",
+        replace_existing=True,
+    )
     scheduler.start()
+    # On cold start, top up everyone's reminders so we don't rely on user saves
+    try:
+        await reschedule_all_active()
+    except Exception as e:
+        logger.warning("Initial reschedule failed: %s", e)
     logger.info("Bot started")
     try:
         await dp.start_polling(bot)
