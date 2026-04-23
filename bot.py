@@ -437,7 +437,10 @@ async def cmd_off(message: types.Message):
 # ─── Entry point (called from main.py lifespan) ───────────────────────────────
 
 async def start_bot():
-    # Remove stale global jobs from previous deploy to avoid duplicate key errors
+    # Start first — this connects to the job store and loads existing jobs from DB
+    scheduler.start()
+
+    # Now that the scheduler is running, remove_job/add_job work properly
     for _jid in ("global_morning", "global_evening", "nightly_reschedule"):
         try:
             scheduler.remove_job(_jid)
@@ -459,7 +462,6 @@ async def start_bot():
         CronTrigger(hour=3, minute=0, timezone="UTC"),
         id="nightly_reschedule",
     )
-    scheduler.start()
     # On cold start, top up everyone's reminders so we don't rely on user saves
     try:
         await reschedule_all_active()
