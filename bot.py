@@ -5,9 +5,11 @@ import os
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import sentry_sdk
 from aiogram import Bot, Dispatcher, types
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
+from apscheduler.events import EVENT_JOB_ERROR
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
@@ -26,8 +28,27 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Single shared scheduler. Jobs persisted in Postgres so they survive restarts.
+# Single shared scheduler (MemoryJobStore — no DB state, no ConflictingIdError).
 scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+def _on_scheduler_error(event) -> None:
+    """Forward APScheduler job exceptions to Sentry."""
+    if event.exception:
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("scheduler.job_id", event.job_id)
+            scope.set_context("scheduler_event", {
+                "job_id": event.job_id,
+                "scheduled_run_time": str(event.scheduled_run_time),
+            })
+            sentry_sdk.capture_exception(event.exception)
+        logger.error(
+            "Scheduler job %s raised: %s", event.job_id, event.exception,
+            exc_info=event.traceback,
+        )
+
+
+scheduler.add_listener(_on_scheduler_error, EVENT_JOB_ERROR)
 
 REMINDER_HORIZON_HOURS = 48  # how far ahead per-habit reminders are scheduled
 JOB_PREFIX = "rem_"  # all user-scheduled reminder jobs start with this

@@ -5,8 +5,12 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any
 
+import sentry_sdk
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -24,6 +28,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WEBAPP_ORIGIN = os.getenv("WEBAPP_ORIGIN", "https://nomeans1987.github.io")
+
+
+def _init_sentry() -> None:
+    dsn = os.getenv("SENTRY_DSN")
+    if not dsn:
+        logger.warning("SENTRY_DSN not set — error tracking disabled")
+        return
+    sentry_sdk.init(
+        dsn=dsn,
+        integrations=[
+            FastApiIntegration(),
+            SqlalchemyIntegration(),
+            LoggingIntegration(
+                level=logging.WARNING,    # breadcrumbs from WARNING+
+                event_level=logging.ERROR,  # create Sentry event on ERROR+
+            ),
+        ],
+        traces_sample_rate=0.0,  # error-only; no perf quota used
+        environment=os.getenv("RAILWAY_ENVIRONMENT", "production"),
+        release=os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"),
+    )
+    logger.info(
+        "Sentry enabled (env=%s)", os.getenv("RAILWAY_ENVIRONMENT", "production")
+    )
+
+
+_init_sentry()
 
 
 def _migrate() -> None:
