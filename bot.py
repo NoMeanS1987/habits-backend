@@ -275,23 +275,24 @@ def _upcoming_fires(
     return fires
 
 
-def reschedule_user_sync(telegram_id: int) -> int:
-    """Rebuild per-habit/per-todo reminder jobs for one user. Returns jobs added."""
-    user = _get_user(telegram_id)
+async def reschedule_user(telegram_id: int) -> int:
+    """Rebuild reminder jobs for one user. Must run on the event loop (not in a thread)."""
+    # DB read is blocking — run in thread pool
+    user = await asyncio.to_thread(_get_user, telegram_id)
     if not user:
         return 0
     state = _parse_state(user)
     tz = _safe_tz(state.get("tz") or user.tz)
     now_utc = datetime.now(timezone.utc)
 
-    # Wipe old jobs for this user first
+    # Scheduler calls MUST happen here (event loop), not inside to_thread.
+    # AsyncIOScheduler is not thread-safe.
     _remove_user_jobs(telegram_id)
 
     if not user.is_active:
         return 0
 
     added = 0
-    # Habits
     for habit in state.get("habits", []):
         hid = habit.get("id")
         time_str = habit.get("reminderTime")
@@ -306,7 +307,6 @@ def reschedule_user_sync(telegram_id: int) -> int:
             _schedule_one(job_id, send_habit_reminder, fire_utc, [telegram_id, hid])
             added += 1
 
-    # Todos
     for todo in state.get("todos", []):
         tid = todo.get("id")
         time_str = todo.get("reminderTime")
@@ -325,18 +325,13 @@ def reschedule_user_sync(telegram_id: int) -> int:
     return added
 
 
-async def reschedule_user(telegram_id: int) -> int:
-    """Async wrapper — safe to call from FastAPI handlers."""
-    return await asyncio.to_thread(reschedule_user_sync, telegram_id)
-
-
 async def reschedule_all_active():
     """Nightly job: extend horizon for every active user."""
     users = await asyncio.to_thread(_get_active_users)
     total = 0
     for u in users:
         try:
-            total += await asyncio.to_thread(reschedule_user_sync, u.telegram_id)
+            total += await reschedule_user(u.telegram_id)  # no to_thread — scheduler ops on event loop
         except Exception as e:
             logger.warning("reschedule failed for %d: %s", u.telegram_id, e)
     logger.info("Nightly reschedule: %d users, %d jobs total", len(users), total)
@@ -435,32 +430,34 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("off"))
 async def cmd_off(message: types.Message):
     await asyncio.to_thread(_set_active, message.from_user.id, False)
-    await asyncio.to_thread(_remove_user_jobs, message.from_user.id)
+    _remove_user_jobs(message.from_user.id)  # scheduler op — event loop only
     await message.answer("Уведомления отключены. /start — включить снова.")
 
 
 # ─── Entry point (called from main.py lifespan) ───────────────────────────────
 
 async def start_bot():
-    # Global summaries in Moscow time (tz-aware trigger)
+    # Remove stale global jobs from previous deploy to avoid duplicate key errors
+    for _jid in ("global_morning", "global_evening", "nightly_reschedule"):
+        try:
+            scheduler.remove_job(_jid)
+        except Exception:
+            pass
+
     scheduler.add_job(
         send_morning_reminder,
         CronTrigger(hour=9, minute=0, timezone="Europe/Moscow"),
         id="global_morning",
-        replace_existing=True,
     )
     scheduler.add_job(
         send_evening_reminder,
         CronTrigger(hour=21, minute=0, timezone="Europe/Moscow"),
         id="global_evening",
-        replace_existing=True,
     )
-    # Nightly reschedule to extend per-user horizon
     scheduler.add_job(
         reschedule_all_active,
         CronTrigger(hour=3, minute=0, timezone="UTC"),
         id="nightly_reschedule",
-        replace_existing=True,
     )
     scheduler.start()
     # On cold start, top up everyone's reminders so we don't rely on user saves
