@@ -8,12 +8,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from aiogram import Bot, Dispatcher, types
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
 
-from database import DATABASE_URL, SessionLocal
+from database import SessionLocal
 from models import User
 
 logger = logging.getLogger(__name__)
@@ -28,10 +27,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # Single shared scheduler. Jobs persisted in Postgres so they survive restarts.
-scheduler = AsyncIOScheduler(
-    jobstores={"default": SQLAlchemyJobStore(url=DATABASE_URL)},
-    timezone="UTC",
-)
+scheduler = AsyncIOScheduler(timezone="UTC")
 
 REMINDER_HORIZON_HOURS = 48  # how far ahead per-habit reminders are scheduled
 JOB_PREFIX = "rem_"  # all user-scheduled reminder jobs start with this
@@ -437,16 +433,6 @@ async def cmd_off(message: types.Message):
 # ─── Entry point (called from main.py lifespan) ───────────────────────────────
 
 async def start_bot():
-    # Start first — this connects to the job store and loads existing jobs from DB
-    scheduler.start()
-
-    # Now that the scheduler is running, remove_job/add_job work properly
-    for _jid in ("global_morning", "global_evening", "nightly_reschedule"):
-        try:
-            scheduler.remove_job(_jid)
-        except Exception:
-            pass
-
     scheduler.add_job(
         send_morning_reminder,
         CronTrigger(hour=9, minute=0, timezone="Europe/Moscow"),
@@ -462,6 +448,7 @@ async def start_bot():
         CronTrigger(hour=3, minute=0, timezone="UTC"),
         id="nightly_reschedule",
     )
+    scheduler.start()
     # On cold start, top up everyone's reminders so we don't rely on user saves
     try:
         await reschedule_all_active()
